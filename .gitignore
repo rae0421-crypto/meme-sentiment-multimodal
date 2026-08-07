@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project data and training artifacts
+data/raw/
+data/processed/
+models/
+checkpoints/
+runs/
+wandb/
+
+# Large model/data files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Local experiment output
+outputs/
+
+# Hugging Face cache
+.cache/
