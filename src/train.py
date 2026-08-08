@@ -3,6 +3,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 import pandas as pd
 
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+
 from text_model import TextSentimentModel
 
 
@@ -50,8 +52,8 @@ class TextDataset(Dataset):
 def evaluate(model, data_loader, device):
     model.eval()
 
-    correct = 0
-    total = 0
+    all_predictions = []
+    all_labels = []
 
     with torch.no_grad():
         for batch in data_loader:
@@ -66,15 +68,41 @@ def evaluate(model, data_loader, device):
 
             predictions = torch.argmax(logits, dim=1)
 
-            correct += (predictions == labels).sum().item()
-            total += labels.size(0)
+            all_predictions.extend(
+                predictions.cpu().numpy()
+            )
+            all_labels.extend(
+                labels.cpu().numpy()
+            )
 
-    accuracy = correct / total if total > 0 else 0
+    accuracy = accuracy_score(
+        all_labels,
+        all_predictions,
+    )
 
-    return accuracy
+    macro_f1 = f1_score(
+        all_labels,
+        all_predictions,
+        average="macro",
+    )
+
+    report = classification_report(
+        all_labels,
+        all_predictions,
+        target_names=[
+            "negative",
+            "neutral",
+            "positive",
+        ],
+        digits=4,
+        zero_division=0,
+    )
+
+    return accuracy, macro_f1, report
 
 
 def main():
+
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -89,7 +117,9 @@ def main():
 
     print("Loading tokenizer...")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name
+    )
 
     # -------------------------
     # Dataset
@@ -109,8 +139,15 @@ def main():
         max_length=64,
     )
 
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
+    print(
+        f"Training samples: "
+        f"{len(train_dataset)}"
+    )
+
+    print(
+        f"Validation samples: "
+        f"{len(val_dataset)}"
+    )
 
     # -------------------------
     # DataLoader
@@ -130,8 +167,15 @@ def main():
         num_workers=0,
     )
 
-    print(f"Training batches: {len(train_loader)}")
-    print(f"Validation batches: {len(val_loader)}")
+    print(
+        f"Training batches: "
+        f"{len(train_loader)}"
+    )
+
+    print(
+        f"Validation batches: "
+        f"{len(val_loader)}"
+    )
 
     # -------------------------
     # Model
@@ -158,8 +202,10 @@ def main():
 
     criterion = torch.nn.CrossEntropyLoss()
 
-    # CPU-friendly setting
     epochs = 1
+
+    # Track best model
+    best_macro_f1 = 0.0
 
     # -------------------------
     # Training
@@ -176,16 +222,27 @@ def main():
 
         total_loss = 0.0
 
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(
+            train_loader
+        ):
 
             print(
                 f"Processing batch "
-                f"{batch_idx + 1}/{len(train_loader)}"
+                f"{batch_idx + 1}/"
+                f"{len(train_loader)}"
             )
 
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["label"].to(device)
+            input_ids = batch[
+                "input_ids"
+            ].to(device)
+
+            attention_mask = batch[
+                "attention_mask"
+            ].to(device)
+
+            labels = batch[
+                "label"
+            ].to(device)
 
             optimizer.zero_grad()
 
@@ -206,14 +263,21 @@ def main():
             total_loss += loss.item()
 
             if (batch_idx + 1) % 50 == 0:
-                avg_loss = total_loss / (batch_idx + 1)
+
+                avg_loss = (
+                    total_loss
+                    / (batch_idx + 1)
+                )
 
                 print(
                     f"  Average Loss: "
                     f"{avg_loss:.4f}"
                 )
 
-        avg_loss = total_loss / len(train_loader)
+        avg_loss = (
+            total_loss
+            / len(train_loader)
+        )
 
         print(
             f"\nEpoch {epoch + 1}/{epochs} "
@@ -231,7 +295,11 @@ def main():
 
         print("Running validation...")
 
-        val_accuracy = evaluate(
+        (
+            val_accuracy,
+            val_macro_f1,
+            report,
+        ) = evaluate(
             model,
             val_loader,
             device,
@@ -242,7 +310,35 @@ def main():
             f"{val_accuracy:.4f}"
         )
 
-    print("\nTraining finished successfully.")
+        print(
+            f"Validation Macro-F1: "
+            f"{val_macro_f1:.4f}"
+        )
+
+        print("\nClassification Report:")
+        print(report)
+
+        # -------------------------
+        # Save best model
+        # -------------------------
+
+        if val_macro_f1 > best_macro_f1:
+
+            best_macro_f1 = val_macro_f1
+
+            torch.save(
+                model.state_dict(),
+                "models/text_model_best.pt",
+            )
+
+            print(
+                "\nBest model saved to "
+                "models/text_model_best.pt"
+            )
+
+    print(
+        "\nTraining finished successfully."
+    )
 
 
 if __name__ == "__main__":
