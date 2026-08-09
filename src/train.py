@@ -1,8 +1,9 @@
 import os
 import random
+
 import numpy as np
-import torch
 import pandas as pd
+import torch
 
 from torch.utils.data import (
     Dataset,
@@ -26,17 +27,17 @@ from text_model import TextSentimentModel
 
 
 # =========================================================
-# Random Seed
+# Reproducibility
 # =========================================================
 
-def set_seed(seed=42):
+SEED = 42
 
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 
 # =========================================================
@@ -64,55 +65,38 @@ class TextDataset(Dataset):
         }
 
         # -------------------------------------------------
-        # Check columns
+        # Check missing text
         # -------------------------------------------------
 
-        required_columns = [
-            "text_corrected",
-            "sentiment",
-        ]
+        missing_count = self.df["text_corrected"].isna().sum()
 
-        for column in required_columns:
-
-            if column not in self.df.columns:
-
-                raise ValueError(
-                    f"Missing required column: {column}"
-                )
-
-        # -------------------------------------------------
-        # Remove missing labels
-        # -------------------------------------------------
-
-        self.df = self.df.dropna(
-            subset=["sentiment"]
-        ).reset_index(drop=True)
-
-        # -------------------------------------------------
-        # Handle missing text
-        # -------------------------------------------------
-
-        missing_text = (
-            self.df["text_corrected"]
-            .isna()
-            .sum()
-        )
-
-        if missing_text > 0:
-
+        if missing_count > 0:
             print(
-                f"Warning: {missing_text} "
-                f"rows have missing text."
+                f"Warning: {missing_count} rows "
+                f"have missing text."
             )
 
-        self.df["text_corrected"] = (
-            self.df["text_corrected"]
-            .fillna("")
-            .astype(str)
+            self.df["text_corrected"] = (
+                self.df["text_corrected"]
+                .fillna("")
+            )
+
+        # -------------------------------------------------
+        # Check labels
+        # -------------------------------------------------
+
+        invalid_labels = (
+            set(self.df["sentiment"].unique())
+            - set(self.label_map.keys())
         )
 
-    def __len__(self):
+        if invalid_labels:
+            raise ValueError(
+                f"Unknown sentiment labels: "
+                f"{invalid_labels}"
+            )
 
+    def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
@@ -136,13 +120,15 @@ class TextDataset(Dataset):
         )
 
         return {
-            "input_ids": encoding[
-                "input_ids"
-            ].squeeze(0),
+            "input_ids": (
+                encoding["input_ids"]
+                .squeeze(0)
+            ),
 
-            "attention_mask": encoding[
-                "attention_mask"
-            ].squeeze(0),
+            "attention_mask": (
+                encoding["attention_mask"]
+                .squeeze(0)
+            ),
 
             "label": torch.tensor(
                 label,
@@ -170,17 +156,20 @@ def evaluate(
 
         for batch in data_loader:
 
-            input_ids = batch[
-                "input_ids"
-            ].to(device)
+            input_ids = (
+                batch["input_ids"]
+                .to(device)
+            )
 
-            attention_mask = batch[
-                "attention_mask"
-            ].to(device)
+            attention_mask = (
+                batch["attention_mask"]
+                .to(device)
+            )
 
-            labels = batch[
-                "label"
-            ].to(device)
+            labels = (
+                batch["label"]
+                .to(device)
+            )
 
             logits = model(
                 input_ids=input_ids,
@@ -231,7 +220,6 @@ def evaluate(
     cm = confusion_matrix(
         all_labels,
         all_predictions,
-        labels=[0, 1, 2],
     )
 
     # -----------------------------------------------------
@@ -243,27 +231,12 @@ def evaluate(
         minlength=3,
     )
 
-    print(
-        "\nPrediction distribution:"
-    )
-
-    print(
-        f"negative: {prediction_counts[0]}"
-    )
-
-    print(
-        f"neutral:  {prediction_counts[1]}"
-    )
-
-    print(
-        f"positive: {prediction_counts[2]}"
-    )
-
     return (
         accuracy,
         macro_f1,
         report,
         cm,
+        prediction_counts,
     )
 
 
@@ -273,15 +246,9 @@ def evaluate(
 
 def main():
 
-    # -----------------------------------------------------
-    # Seed
-    # -----------------------------------------------------
-
-    set_seed(42)
-
-    # -----------------------------------------------------
+    # =====================================================
     # Device
-    # -----------------------------------------------------
+    # =====================================================
 
     device = torch.device(
         "cuda"
@@ -294,15 +261,31 @@ def main():
         device,
     )
 
-    # -----------------------------------------------------
-    # Model
-    # -----------------------------------------------------
+    # =====================================================
+    # Configuration
+    # =====================================================
 
     model_name = "bert-base-uncased"
 
-    # -----------------------------------------------------
+    max_length = 64
+
+    batch_size = 4
+
+    # IMPORTANT:
+    # Increased from 1e-5 to 2e-5
+    learning_rate = 2e-5
+
+    epochs = 5
+
+    patience = 2
+
+    weight_decay = 0.01
+
+    warmup_ratio = 0.1
+
+    # =====================================================
     # Tokenizer
-    # -----------------------------------------------------
+    # =====================================================
 
     print(
         "\nLoading tokenizer..."
@@ -312,9 +295,9 @@ def main():
         model_name
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # Dataset
-    # -----------------------------------------------------
+    # =====================================================
 
     print(
         "\nLoading datasets..."
@@ -323,13 +306,13 @@ def main():
     train_dataset = TextDataset(
         "data/processed/train.csv",
         tokenizer,
-        max_length=64,
+        max_length=max_length,
     )
 
     val_dataset = TextDataset(
         "data/processed/val.csv",
         tokenizer,
-        max_length=64,
+        max_length=max_length,
     )
 
     print(
@@ -342,9 +325,9 @@ def main():
         f"{len(val_dataset)}"
     )
 
-    # -----------------------------------------------------
-    # Label distribution
-    # -----------------------------------------------------
+    # =====================================================
+    # Label Distribution
+    # =====================================================
 
     print(
         "\nTraining label distribution:"
@@ -390,32 +373,26 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
-    # Training labels
-    # -----------------------------------------------------
-
-    train_labels = [
-        train_dataset.label_map[x]
-        for x in train_dataset.df[
-            "sentiment"
-        ]
-    ]
-
-    train_labels_tensor = torch.tensor(
-        train_labels,
-        dtype=torch.long,
-    )
-
-    # -----------------------------------------------------
-    # Weighted Random Sampler
-    # -----------------------------------------------------
+    # =====================================================
+    # WeightedRandomSampler
+    # =====================================================
 
     print(
         "\nCreating WeightedRandomSampler..."
     )
 
-    class_counts = torch.bincount(
-        train_labels_tensor,
+    train_labels = np.array(
+        [
+            train_dataset.label_map[label]
+            for label
+            in train_dataset.df[
+                "sentiment"
+            ]
+        ]
+    )
+
+    class_counts = np.bincount(
+        train_labels,
         minlength=3,
     )
 
@@ -424,24 +401,25 @@ def main():
     )
 
     print(
-        f"negative: "
-        f"{class_counts[0].item()}"
+        f"negative: {class_counts[0]}"
     )
 
     print(
-        f"neutral:  "
-        f"{class_counts[1].item()}"
+        f"neutral:  {class_counts[1]}"
     )
 
     print(
-        f"positive: "
-        f"{class_counts[2].item()}"
+        f"positive: {class_counts[2]}"
     )
 
-    # Inverse frequency
-    sampler_class_weights = (
-        1.0
-        / class_counts.float()
+    # -----------------------------------------------------
+    # Square-root inverse frequency
+    #
+    # Less aggressive than 1 / class_counts
+    # -----------------------------------------------------
+
+    class_weights = (
+        1.0 / np.sqrt(class_counts)
     )
 
     print(
@@ -450,24 +428,22 @@ def main():
 
     print(
         f"negative: "
-        f"{sampler_class_weights[0].item():.6f}"
+        f"{class_weights[0]:.6f}"
     )
 
     print(
         f"neutral:  "
-        f"{sampler_class_weights[1].item():.6f}"
+        f"{class_weights[1]:.6f}"
     )
 
     print(
         f"positive: "
-        f"{sampler_class_weights[2].item():.6f}"
+        f"{class_weights[2]:.6f}"
     )
 
     sample_weights = torch.tensor(
         [
-            sampler_class_weights[
-                label
-            ].item()
+            class_weights[label]
             for label in train_labels
         ],
         dtype=torch.double,
@@ -481,20 +457,20 @@ def main():
         replacement=True,
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # DataLoader
-    # -----------------------------------------------------
+    # =====================================================
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=4,
+        batch_size=batch_size,
         sampler=sampler,
         num_workers=0,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=4,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=0,
     )
@@ -509,9 +485,9 @@ def main():
         f"{len(val_loader)}"
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # Model
-    # -----------------------------------------------------
+    # =====================================================
 
     print(
         "\nLoading model..."
@@ -527,87 +503,124 @@ def main():
         "Model loaded successfully."
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # Loss
-    # -----------------------------------------------------
-    #
-    # Mild class weighting.
-    #
-    # Sampler already handles most of the imbalance.
-    # Therefore we use only mild additional weighting.
-    #
+    # =====================================================
 
-    class_weights = torch.tensor(
-        [1.5, 1.0, 0.8],
-        dtype=torch.float,
-    ).to(device)
+    # IMPORTANT:
+    #
+    # NO class weights here.
+    #
+    # WeightedRandomSampler already handles
+    # class imbalance.
+    #
+    # Using both sampler + class-weighted loss
+    # can over-correct minority classes.
+    # =====================================================
+
+    criterion = torch.nn.CrossEntropyLoss()
 
     print(
-        "\nLoss class weights:"
+        "\nLoss function:"
     )
 
     print(
-        class_weights
+        "CrossEntropyLoss "
+        "(no class weights)"
     )
 
-    criterion = torch.nn.CrossEntropyLoss(
-        weight=class_weights
-    )
-
-    # -----------------------------------------------------
+    # =====================================================
     # Optimizer
-    # -----------------------------------------------------
-
-    learning_rate = 2e-5
+    # =====================================================
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
-        weight_decay=0.01,
+        weight_decay=weight_decay,
     )
 
-    # -----------------------------------------------------
-    # Training settings
-    # -----------------------------------------------------
-
-    epochs = 5
+    # =====================================================
+    # Scheduler
+    # =====================================================
 
     total_steps = (
         len(train_loader)
         * epochs
     )
 
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(
-            total_steps * 0.1
-        ),
-        num_training_steps=total_steps,
+    warmup_steps = int(
+        total_steps * warmup_ratio
     )
 
-    # -----------------------------------------------------
-    # Best model
-    # -----------------------------------------------------
+    scheduler = (
+        get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+    )
 
-    best_macro_f1 = -1.0
+    print(
+        "\nTraining configuration:"
+    )
 
-    patience = 2
+    print(
+        f"Learning rate: "
+        f"{learning_rate}"
+    )
 
-    epochs_without_improvement = 0
+    print(
+        f"Batch size: "
+        f"{batch_size}"
+    )
+
+    print(
+        f"Epochs: "
+        f"{epochs}"
+    )
+
+    print(
+        f"Weight decay: "
+        f"{weight_decay}"
+    )
+
+    print(
+        f"Warmup ratio: "
+        f"{warmup_ratio}"
+    )
+
+    print(
+        f"Warmup steps: "
+        f"{warmup_steps}"
+    )
+
+    print(
+        f"Total training steps: "
+        f"{total_steps}"
+    )
+
+    # =====================================================
+    # Best Model / Early Stopping
+    # =====================================================
 
     os.makedirs(
         "models",
         exist_ok=True,
     )
 
-    # -----------------------------------------------------
-    # Training
-    # -----------------------------------------------------
+    best_macro_f1 = 0.0
+
+    early_stop_counter = 0
+
+    # =====================================================
+    # Training Loop
+    # =====================================================
 
     for epoch in range(epochs):
 
         print(
-            f"\n{'=' * 60}"
+            "\n"
+            + "=" * 60
         )
 
         print(
@@ -616,7 +629,7 @@ def main():
         )
 
         print(
-            f"{'=' * 60}"
+            "=" * 60
         )
 
         model.train()
@@ -624,72 +637,61 @@ def main():
         total_loss = 0.0
 
         # -------------------------------------------------
-        # Training loop
+        # Training
         # -------------------------------------------------
 
-        for (
-            batch_idx,
-            batch,
-        ) in enumerate(
+        for batch_idx, batch in enumerate(
             train_loader
         ):
 
-            input_ids = batch[
-                "input_ids"
-            ].to(device)
+            input_ids = (
+                batch["input_ids"]
+                .to(device)
+            )
 
-            attention_mask = batch[
-                "attention_mask"
-            ].to(device)
+            attention_mask = (
+                batch["attention_mask"]
+                .to(device)
+            )
 
-            labels = batch[
-                "label"
-            ].to(device)
-
-            # ---------------------------------------------
-            # Forward
-            # ---------------------------------------------
+            labels = (
+                batch["label"]
+                .to(device)
+            )
 
             optimizer.zero_grad()
 
+            # Forward
             logits = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
 
+            # Loss
             loss = criterion(
                 logits,
                 labels,
             )
 
-            # ---------------------------------------------
             # Backward
-            # ---------------------------------------------
-
             loss.backward()
 
-            # ---------------------------------------------
             # Gradient clipping
-            # ---------------------------------------------
-
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 max_norm=1.0,
             )
 
-            # ---------------------------------------------
-            # Optimizer
-            # ---------------------------------------------
-
+            # Update
             optimizer.step()
 
             scheduler.step()
 
             total_loss += loss.item()
 
-            # ---------------------------------------------
+            # -------------------------------------------------
             # Progress
-            # ---------------------------------------------
+            # -------------------------------------------------
 
             if (
                 batch_idx + 1
@@ -697,9 +699,11 @@ def main():
 
                 avg_loss = (
                     total_loss
-                    / (
-                        batch_idx + 1
-                    )
+                    / (batch_idx + 1)
+                )
+
+                current_lr = (
+                    optimizer.param_groups[0]["lr"]
                 )
 
                 print(
@@ -707,12 +711,14 @@ def main():
                     f"{batch_idx + 1}/"
                     f"{len(train_loader)} "
                     f"| Loss: "
-                    f"{avg_loss:.4f}"
+                    f"{avg_loss:.4f} "
+                    f"| LR: "
+                    f"{current_lr:.2e}"
                 )
 
-        # -------------------------------------------------
-        # Epoch loss
-        # -------------------------------------------------
+        # =================================================
+        # Epoch Loss
+        # =================================================
 
         avg_loss = (
             total_loss
@@ -730,9 +736,14 @@ def main():
             f"{avg_loss:.4f}"
         )
 
-        # -------------------------------------------------
+        print(
+            f"Final Epoch LR: "
+            f"{optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+        # =================================================
         # Validation
-        # -------------------------------------------------
+        # =================================================
 
         print(
             "\nRunning validation..."
@@ -743,11 +754,39 @@ def main():
             val_macro_f1,
             report,
             cm,
+            prediction_counts,
         ) = evaluate(
             model,
             val_loader,
             device,
         )
+
+        # -------------------------------------------------
+        # Prediction Distribution
+        # -------------------------------------------------
+
+        print(
+            "\nPrediction distribution:"
+        )
+
+        print(
+            f"negative: "
+            f"{prediction_counts[0]}"
+        )
+
+        print(
+            f"neutral:  "
+            f"{prediction_counts[1]}"
+        )
+
+        print(
+            f"positive: "
+            f"{prediction_counts[2]}"
+        )
+
+        # -------------------------------------------------
+        # Metrics
+        # -------------------------------------------------
 
         print(
             f"\nValidation Accuracy: "
@@ -759,19 +798,15 @@ def main():
             f"{val_macro_f1:.4f}"
         )
 
-        # -------------------------------------------------
-        # Classification report
-        # -------------------------------------------------
-
         print(
             "\nClassification Report:"
         )
 
         print(report)
 
-        # -------------------------------------------------
-        # Confusion matrix
-        # -------------------------------------------------
+        # =================================================
+        # Confusion Matrix
+        # =================================================
 
         print(
             "\nConfusion Matrix:"
@@ -810,9 +845,9 @@ def main():
             f"{cm[2][2]:4d}"
         )
 
-        # -------------------------------------------------
-        # Save best model
-        # -------------------------------------------------
+        # =================================================
+        # Save Best Model
+        # =================================================
 
         if (
             val_macro_f1
@@ -822,8 +857,6 @@ def main():
             best_macro_f1 = (
                 val_macro_f1
             )
-
-            epochs_without_improvement = 0
 
             torch.save(
                 model.state_dict(),
@@ -835,9 +868,11 @@ def main():
                 "models/text_model_best.pt"
             )
 
+            early_stop_counter = 0
+
         else:
 
-            epochs_without_improvement += 1
+            early_stop_counter += 1
 
             print(
                 "\nNo improvement."
@@ -845,24 +880,25 @@ def main():
 
             print(
                 f"Early stopping counter: "
-                f"{epochs_without_improvement}/"
+                f"{early_stop_counter}/"
                 f"{patience}"
             )
 
             if (
-                epochs_without_improvement
+                early_stop_counter
                 >= patience
             ):
 
                 print(
-                    "\nEarly stopping triggered."
+                    "\nEarly stopping "
+                    "triggered."
                 )
 
                 break
 
-    # -----------------------------------------------------
+    # =====================================================
     # Finished
-    # -----------------------------------------------------
+    # =====================================================
 
     print(
         "\n"
