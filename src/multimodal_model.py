@@ -10,7 +10,6 @@ class MultimodalSentimentModel(nn.Module):
         self,
         text_model_name="distilbert-base-uncased",
         num_classes=3,
-        freeze_encoders=True,
     ):
         super().__init__()
 
@@ -24,11 +23,6 @@ class MultimodalSentimentModel(nn.Module):
 
         text_dim = self.text_encoder.config.hidden_size
 
-        # Freeze DistilBERT
-        if freeze_encoders:
-            for param in self.text_encoder.parameters():
-                param.requires_grad = False
-
         # =====================================================
         # Image Encoder
         # =====================================================
@@ -41,45 +35,40 @@ class MultimodalSentimentModel(nn.Module):
 
         self.image_encoder.fc = nn.Identity()
 
-        # Freeze ResNet
-        if freeze_encoders:
-            for param in self.image_encoder.parameters():
-                param.requires_grad = False
-
         # =====================================================
-        # Projection
+        # Projection layers
         # =====================================================
 
         self.text_projection = nn.Sequential(
             nn.Linear(text_dim, 256),
             nn.LayerNorm(256),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.3),
         )
 
         self.image_projection = nn.Sequential(
             nn.Linear(image_dim, 256),
             nn.LayerNorm(256),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.3),
         )
 
         # =====================================================
-        # Multimodal Fusion
+        # Multimodal fusion
         # =====================================================
 
-        # text + image + element-wise interaction
         fusion_dim = 256 * 3
 
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim, 256),
             nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.GELU(),
+            nn.Dropout(0.5),
 
             nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(0.4),
         )
 
         # =====================================================
