@@ -5,11 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from torch.utils.data import (
-    Dataset,
-    DataLoader,
-    WeightedRandomSampler,
-)
+from torch.utils.data import Dataset, DataLoader
 
 from transformers import (
     AutoTokenizer,
@@ -65,12 +61,13 @@ class TextDataset(Dataset):
         }
 
         # -------------------------------------------------
-        # Check missing text
+        # Missing text
         # -------------------------------------------------
 
         missing_count = self.df["text_corrected"].isna().sum()
 
         if missing_count > 0:
+
             print(
                 f"Warning: {missing_count} rows "
                 f"have missing text."
@@ -91,12 +88,14 @@ class TextDataset(Dataset):
         )
 
         if invalid_labels:
+
             raise ValueError(
                 f"Unknown sentiment labels: "
                 f"{invalid_labels}"
             )
 
     def __len__(self):
+
         return len(self.df)
 
     def __getitem__(self, idx):
@@ -222,10 +221,6 @@ def evaluate(
         all_predictions,
     )
 
-    # -----------------------------------------------------
-    # Prediction distribution
-    # -----------------------------------------------------
-
     prediction_counts = np.bincount(
         all_predictions,
         minlength=3,
@@ -272,7 +267,7 @@ def main():
     batch_size = 4
 
     # IMPORTANT:
-    # Increased from 1e-5 to 2e-5
+    # New learning rate
     learning_rate = 2e-5
 
     epochs = 5
@@ -361,25 +356,9 @@ def main():
         ].value_counts()
     )
 
-    print(
-        "\nValidation label percentage:"
-    )
-
-    print(
-        val_dataset.df[
-            "sentiment"
-        ].value_counts(
-            normalize=True
-        )
-    )
-
     # =====================================================
-    # WeightedRandomSampler
+    # Class Counts
     # =====================================================
-
-    print(
-        "\nCreating WeightedRandomSampler..."
-    )
 
     train_labels = np.array(
         [
@@ -412,59 +391,21 @@ def main():
         f"positive: {class_counts[2]}"
     )
 
-    # -----------------------------------------------------
-    # Square-root inverse frequency
-    #
-    # Less aggressive than 1 / class_counts
-    # -----------------------------------------------------
-
-    class_weights = (
-        1.0 / np.sqrt(class_counts)
-    )
-
-    print(
-        "\nSampler class weights:"
-    )
-
-    print(
-        f"negative: "
-        f"{class_weights[0]:.6f}"
-    )
-
-    print(
-        f"neutral:  "
-        f"{class_weights[1]:.6f}"
-    )
-
-    print(
-        f"positive: "
-        f"{class_weights[2]:.6f}"
-    )
-
-    sample_weights = torch.tensor(
-        [
-            class_weights[label]
-            for label in train_labels
-        ],
-        dtype=torch.double,
-    )
-
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(
-            sample_weights
-        ),
-        replacement=True,
-    )
-
     # =====================================================
     # DataLoader
     # =====================================================
 
+    # IMPORTANT:
+    #
+    # NO WeightedRandomSampler
+    #
+    # We keep the original training distribution
+    # and let CrossEntropyLoss handle imbalance.
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        sampler=sampler,
+        shuffle=True,
         num_workers=0,
     )
 
@@ -504,21 +445,54 @@ def main():
     )
 
     # =====================================================
+    # Class Weighted Loss
+    # =====================================================
+
+    # -----------------------------------------------------
+    # Calculate class weights
+    # -----------------------------------------------------
+
+    total_samples = class_counts.sum()
+
+    class_weights = (
+        total_samples
+        / (
+            3.0
+            * class_counts
+        )
+    )
+
+    class_weights = torch.tensor(
+        class_weights,
+        dtype=torch.float32,
+    ).to(device)
+
+    print(
+        "\nClass weights:"
+    )
+
+    print(
+        f"negative: "
+        f"{class_weights[0].item():.4f}"
+    )
+
+    print(
+        f"neutral:  "
+        f"{class_weights[1].item():.4f}"
+    )
+
+    print(
+        f"positive: "
+        f"{class_weights[2].item():.4f}"
+    )
+
+    # =====================================================
     # Loss
     # =====================================================
 
-    # IMPORTANT:
-    #
-    # NO class weights here.
-    #
-    # WeightedRandomSampler already handles
-    # class imbalance.
-    #
-    # Using both sampler + class-weighted loss
-    # can over-correct minority classes.
-    # =====================================================
-
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(
+        weight=class_weights
+    )
 
     print(
         "\nLoss function:"
@@ -526,7 +500,7 @@ def main():
 
     print(
         "CrossEntropyLoss "
-        "(no class weights)"
+        "(WITH class weights)"
     )
 
     # =====================================================
@@ -549,7 +523,8 @@ def main():
     )
 
     warmup_steps = int(
-        total_steps * warmup_ratio
+        total_steps
+        * warmup_ratio
     )
 
     scheduler = (
@@ -600,7 +575,7 @@ def main():
     )
 
     # =====================================================
-    # Best Model / Early Stopping
+    # Save directory
     # =====================================================
 
     os.makedirs(
@@ -667,7 +642,7 @@ def main():
                 attention_mask=attention_mask,
             )
 
-            # Loss
+            # Weighted loss
             loss = criterion(
                 logits,
                 labels,
@@ -699,11 +674,16 @@ def main():
 
                 avg_loss = (
                     total_loss
-                    / (batch_idx + 1)
+                    / (
+                        batch_idx
+                        + 1
+                    )
                 )
 
                 current_lr = (
-                    optimizer.param_groups[0]["lr"]
+                    optimizer.param_groups[0][
+                        "lr"
+                    ]
                 )
 
                 print(
@@ -725,6 +705,12 @@ def main():
             / len(train_loader)
         )
 
+        final_lr = (
+            optimizer.param_groups[0][
+                "lr"
+            ]
+        )
+
         print(
             f"\nEpoch "
             f"{epoch + 1}/{epochs} "
@@ -738,7 +724,7 @@ def main():
 
         print(
             f"Final Epoch LR: "
-            f"{optimizer.param_groups[0]['lr']:.2e}"
+            f"{final_lr:.2e}"
         )
 
         # =================================================
