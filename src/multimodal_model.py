@@ -1,83 +1,64 @@
 import torch
 import torch.nn as nn
+
 from transformers import AutoModel
 from torchvision.models import resnet18, ResNet18_Weights
 
 
-class MultimodalSentimentModel(nn.Module):
+MODEL_NAME = "distilbert-base-uncased"
+
+
+class MultimodalSentimentModelV4(nn.Module):
 
     def __init__(
         self,
-        text_model_name="distilbert-base-uncased",
+        text_model_name=MODEL_NAME,
         num_classes=3,
+        dropout=0.3,
     ):
         super().__init__()
 
-        # =====================================================
-        # Text Encoder
-        # =====================================================
-
+        # Text encoder: DistilBERT
         self.text_encoder = AutoModel.from_pretrained(
             text_model_name
         )
 
         text_dim = self.text_encoder.config.hidden_size
 
-        # =====================================================
-        # Image Encoder
-        # =====================================================
-
+        # Image encoder: ResNet18
         self.image_encoder = resnet18(
             weights=ResNet18_Weights.DEFAULT
         )
 
         image_dim = self.image_encoder.fc.in_features
 
+        # Remove original ResNet classifier
         self.image_encoder.fc = nn.Identity()
 
-        # =====================================================
-        # Projection layers
-        # =====================================================
-
-        self.text_projection = nn.Sequential(
-            nn.Linear(text_dim, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.3),
+        # Text projection: 768 -> 256
+        self.text_projection = nn.Linear(
+            text_dim,
+            256,
         )
 
-        self.image_projection = nn.Sequential(
-            nn.Linear(image_dim, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.3),
+        # Image projection: 512 -> 256
+        self.image_projection = nn.Linear(
+            image_dim,
+            256,
         )
 
-        # =====================================================
-        # Multimodal fusion
-        # =====================================================
-
-        fusion_dim = 256 * 3
-
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_dim, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.5),
-
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Dropout(0.4),
-        )
-
-        # =====================================================
-        # Classifier
-        # =====================================================
-
-        self.classifier = nn.Linear(
-            128,
-            num_classes,
+        # Fusion classifier: 512 -> 256 -> 3
+        self.classifier = nn.Sequential(
+            nn.Linear(
+                512,
+                256,
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(
+                256,
+                num_classes,
+            ),
         )
 
     def forward(
@@ -87,28 +68,21 @@ class MultimodalSentimentModel(nn.Module):
         images,
     ):
 
-        # =====================================================
-        # Text
-        # =====================================================
-
+        # Text features
         text_output = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
-        # Mean pooling
-        text_features = text_output.last_hidden_state.mean(
-            dim=1
+        text_features = (
+            text_output.last_hidden_state[:, 0, :]
         )
 
         text_features = self.text_projection(
             text_features
         )
 
-        # =====================================================
-        # Image
-        # =====================================================
-
+        # Image features
         image_features = self.image_encoder(
             images
         )
@@ -117,37 +91,18 @@ class MultimodalSentimentModel(nn.Module):
             image_features
         )
 
-        # =====================================================
-        # Cross-modal interaction
-        # =====================================================
-
-        interaction = (
-            text_features * image_features
-        )
-
-        # =====================================================
-        # Fusion
-        # =====================================================
-
-        fused_features = torch.cat(
+        # Combine text + image
+        fused = torch.cat(
             [
                 text_features,
                 image_features,
-                interaction,
             ],
             dim=1,
         )
 
-        fused_features = self.fusion(
-            fused_features
-        )
-
-        # =====================================================
-        # Classification
-        # =====================================================
-
+        # Sentiment prediction
         logits = self.classifier(
-            fused_features
+            fused
         )
 
         return logits
