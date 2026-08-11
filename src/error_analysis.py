@@ -1,758 +1,899 @@
-import os
-import random
+from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import torch
+import torch.nn as nn
+import pandas as pd
 
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+
+from transformers import AutoTokenizer, AutoModel
+
+from torchvision import transforms
+from torchvision.models import resnet18, ResNet18_Weights
 
 from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
     classification_report,
     confusion_matrix,
 )
 
-from text_model import TextSentimentModel
+
+# ============================================================
+# Paths
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+VAL_CSV = (
+    BASE_DIR
+    / "data"
+    / "processed"
+    / "val.csv"
+)
+
+IMAGE_DIR = (
+    BASE_DIR
+    / "data"
+    / "raw"
+    / "memotion_dataset_7k"
+    / "images"
+)
+
+MODEL_PATH = (
+    BASE_DIR
+    / "models"
+    / "best_multimodal_model.pt"
+)
+
+OUTPUT_PATH = (
+    BASE_DIR
+    / "data"
+    / "processed"
+    / "error_analysis.csv"
+)
 
 
-# =========================================================
-# Reproducibility
-# =========================================================
-
-SEED = 42
-
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-
-
-# =========================================================
+# ============================================================
 # Configuration
-# =========================================================
+# ============================================================
 
-MODEL_NAME = "bert-base-uncased"
+MODEL_NAME = "distilbert-base-uncased"
 
-VAL_PATH = "data/processed/val.csv"
-
-MODEL_PATH = "models/text_model_best.pt"
-
-OUTPUT_PATH = "data/error_analysis.csv"
+BATCH_SIZE = 16
 
 MAX_LENGTH = 64
 
-BATCH_SIZE = 8
+NUM_CLASSES = 3
+
+LABEL_NAMES = [
+    "negative",
+    "neutral",
+    "positive",
+]
 
 
-LABEL_MAP = {
-    "negative": 0,
-    "neutral": 1,
-    "positive": 2,
-}
+# ============================================================
+# Device
+# ============================================================
 
-ID_TO_LABEL = {
-    0: "negative",
-    1: "neutral",
-    2: "positive",
-}
+device = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+print(
+    f"Using device: {device}"
+)
 
 
-# =========================================================
-# Dataset
-# =========================================================
+# ============================================================
+# V1 MODEL
+# ============================================================
 
-class TextDataset(Dataset):
+class V1MultimodalModel(nn.Module):
 
     def __init__(
         self,
-        csv_path,
-        tokenizer,
-        max_length=64,
+        text_model_name="distilbert-base-uncased",
+        num_classes=3,
     ):
 
-        self.df = pd.read_csv(csv_path)
+        super().__init__()
 
-        self.tokenizer = tokenizer
+        # ----------------------------------------------------
+        # Text encoder
+        # ----------------------------------------------------
 
-        self.max_length = max_length
-
-        # Missing text
-        missing_count = self.df["text_corrected"].isna().sum()
-
-        if missing_count > 0:
-
-            print(
-                f"Warning: {missing_count} rows have "
-                f"missing text."
-            )
-
-            self.df["text_corrected"] = (
-                self.df["text_corrected"]
-                .fillna("")
-            )
-
-        # Check labels
-        invalid_labels = (
-            set(self.df["sentiment"].unique())
-            - set(LABEL_MAP.keys())
+        self.text_encoder = AutoModel.from_pretrained(
+            text_model_name
         )
 
-        if invalid_labels:
-
-            raise ValueError(
-                f"Unknown sentiment labels: "
-                f"{invalid_labels}"
-            )
-
-    def __len__(self):
-
-        return len(self.df)
-
-    def __getitem__(self, idx):
-
-        row = self.df.iloc[idx]
-
-        text = str(
-            row["text_corrected"]
+        text_dim = (
+            self.text_encoder.config.hidden_size
         )
 
-        label = LABEL_MAP[
-            row["sentiment"]
-        ]
+        # ----------------------------------------------------
+        # Image encoder
+        # ----------------------------------------------------
 
-        encoding = self.tokenizer(
-            text,
+        self.image_encoder = resnet18(
+            weights=ResNet18_Weights.DEFAULT
+        )
+
+        image_dim = (
+            self.image_encoder.fc.in_features
+        )
+
+        self.image_encoder.fc = nn.Identity()
+
+        # ----------------------------------------------------
+        # Projection
+        # ----------------------------------------------------
+
+        self.text_projection = nn.Linear(
+            text_dim,
+            256,
+        )
+
+        self.image_projection = nn.Linear(
+            image_dim,
+            256,
+        )
+
+        # ----------------------------------------------------
+        # Classifier
+        #
+        # This matches the V1 checkpoint:
+        #
+        # text_projection.weight
+        # text_projection.bias
+        #
+        # image_projection.weight
+        # image_projection.bias
+        #
+        # classifier.0
+        # classifier.3
+        # ----------------------------------------------------
+
+        self.classifier = nn.Sequential(
+            nn.Linear(
+                256 * 2,
+                256,
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                0.3
+            ),
+
+            nn.Linear(
+                256,
+                num_classes,
+            ),
+        )
+
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        images,
+    ):
+
+        # ----------------------------------------------------
+        # Text
+        # ----------------------------------------------------
+
+        text_output = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        # CLS representation
+        text_features = (
+            text_output.last_hidden_state[:, 0, :]
+        )
+
+        text_features = self.text_projection(
+            text_features
+        )
+
+        # ----------------------------------------------------
+        # Image
+        # ----------------------------------------------------
+
+        image_features = self.image_encoder(
+            images
+        )
+
+        image_features = self.image_projection(
+            image_features
+        )
+
+        # ----------------------------------------------------
+        # Fusion
+        # ----------------------------------------------------
+
+        fused = torch.cat(
+            [
+                text_features,
+                image_features,
+            ],
+            dim=1,
+        )
+
+        # ----------------------------------------------------
+        # Classification
+        # ----------------------------------------------------
+
+        logits = self.classifier(
+            fused
+        )
+
+        return logits
+
+
+# ============================================================
+# Transform
+# ============================================================
+
+transform = transforms.Compose(
+    [
+        transforms.Resize(
+            (224, 224)
+        ),
+
+        transforms.ToTensor(),
+
+        transforms.Normalize(
+            mean=[
+                0.485,
+                0.456,
+                0.406,
+            ],
+
+            std=[
+                0.229,
+                0.224,
+                0.225,
+            ],
+        ),
+    ]
+)
+
+
+# ============================================================
+# Tokenizer
+# ============================================================
+
+print(
+    "\nLoading tokenizer..."
+)
+
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_NAME
+)
+
+
+# ============================================================
+# Dataset
+# ============================================================
+
+print(
+    "\nLoading validation dataset..."
+)
+
+
+# IMPORTANT:
+# We import your existing dataset.py here.
+#
+from dataset import MemotionDataset
+
+
+dataset = MemotionDataset(
+    csv_path=VAL_CSV,
+    image_dir=IMAGE_DIR,
+    tokenizer=tokenizer,
+    transform=transform,
+)
+
+
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=0,
+)
+
+
+print(
+    f"Validation samples: {len(dataset)}"
+)
+
+
+# ============================================================
+# Model
+# ============================================================
+
+print(
+    "\nLoading V1 model..."
+)
+
+
+model = V1MultimodalModel(
+    text_model_name=MODEL_NAME,
+    num_classes=NUM_CLASSES,
+)
+
+
+checkpoint = torch.load(
+    MODEL_PATH,
+    map_location=device,
+)
+
+
+print(
+    "\nCheckpoint keys:"
+)
+
+if isinstance(
+    checkpoint,
+    dict,
+):
+
+    print(
+        checkpoint.keys()
+    )
+
+
+# ------------------------------------------------------------
+# Load checkpoint
+# ------------------------------------------------------------
+
+if (
+    isinstance(checkpoint, dict)
+    and "model_state_dict" in checkpoint
+):
+
+    state_dict = checkpoint[
+        "model_state_dict"
+    ]
+
+else:
+
+    state_dict = checkpoint
+
+
+model.load_state_dict(
+    state_dict
+)
+
+
+model = model.to(device)
+
+model.eval()
+
+
+print(
+    "✓ V1 model loaded successfully."
+)
+
+
+# ============================================================
+# Prediction
+# ============================================================
+
+all_results = []
+
+all_true = []
+
+all_pred = []
+
+print(
+    "\nRunning predictions..."
+)
+
+
+sample_index = 0
+
+
+with torch.no_grad():
+
+    for batch in loader:
+
+        images = batch[
+            "image"
+        ].to(device)
+
+        labels = batch[
+            "label"
+        ].to(device)
+
+        texts = list(
+            batch["text"]
+        )
+
+        encoding = tokenizer(
+            texts,
+
+            padding=True,
+
             truncation=True,
-            padding="max_length",
-            max_length=self.max_length,
+
+            max_length=MAX_LENGTH,
+
             return_tensors="pt",
         )
 
-        return {
-            "input_ids": (
-                encoding["input_ids"]
-                .squeeze(0)
-            ),
+        input_ids = encoding[
+            "input_ids"
+        ].to(device)
 
-            "attention_mask": (
-                encoding["attention_mask"]
-                .squeeze(0)
-            ),
+        attention_mask = encoding[
+            "attention_mask"
+        ].to(device)
 
-            "label": torch.tensor(
-                label,
-                dtype=torch.long,
-            ),
-        }
+        logits = model(
+            input_ids=input_ids,
 
+            attention_mask=attention_mask,
 
-# =========================================================
-# Main
-# =========================================================
-
-def main():
-
-    # =====================================================
-    # Device
-    # =====================================================
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    print(
-        "Using device:",
-        device,
-    )
-
-
-    # =====================================================
-    # Load tokenizer
-    # =====================================================
-
-    print(
-        "\nLoading tokenizer..."
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME
-    )
-
-
-    # =====================================================
-    # Load validation dataset
-    # =====================================================
-
-    print(
-        "\nLoading validation dataset..."
-    )
-
-    dataset = TextDataset(
-        VAL_PATH,
-        tokenizer,
-        max_length=MAX_LENGTH,
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-    )
-
-    print(
-        f"Validation samples: "
-        f"{len(dataset)}"
-    )
-
-
-    # =====================================================
-    # Load model
-    # =====================================================
-
-    print(
-        "\nLoading best model..."
-    )
-
-    model = TextSentimentModel(
-        model_name=MODEL_NAME,
-        num_classes=3,
-        dropout=0.3,
-    ).to(device)
-
-    state_dict = torch.load(
-        MODEL_PATH,
-        map_location=device,
-    )
-
-    model.load_state_dict(
-        state_dict
-    )
-
-    model.eval()
-
-    print(
-        "Best model loaded successfully."
-    )
-
-
-    # =====================================================
-    # Prediction
-    # =====================================================
-
-    all_predictions = []
-
-    all_labels = []
-
-    all_confidences = []
-
-    print(
-        "\nRunning predictions..."
-    )
-
-    with torch.no_grad():
-
-        for batch in loader:
-
-            input_ids = (
-                batch["input_ids"]
-                .to(device)
-            )
-
-            attention_mask = (
-                batch["attention_mask"]
-                .to(device)
-            )
-
-            labels = (
-                batch["label"]
-                .to(device)
-            )
-
-            logits = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-
-            probabilities = torch.softmax(
-                logits,
-                dim=1,
-            )
-
-            predictions = torch.argmax(
-                probabilities,
-                dim=1,
-            )
-
-            confidences = torch.max(
-                probabilities,
-                dim=1,
-            ).values
-
-            all_predictions.extend(
-                predictions.cpu().numpy()
-            )
-
-            all_labels.extend(
-                labels.cpu().numpy()
-            )
-
-            all_confidences.extend(
-                confidences.cpu().numpy()
-            )
-
-
-    # =====================================================
-    # Metrics
-    # =====================================================
-
-    accuracy = accuracy_score(
-        all_labels,
-        all_predictions,
-    )
-
-    macro_f1 = f1_score(
-        all_labels,
-        all_predictions,
-        average="macro",
-        zero_division=0,
-    )
-
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "Validation Results"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        f"Accuracy: {accuracy:.4f}"
-    )
-
-    print(
-        f"Macro-F1: {macro_f1:.4f}"
-    )
-
-
-    # =====================================================
-    # Classification Report
-    # =====================================================
-
-    print(
-        "\nClassification Report:"
-    )
-
-    report = classification_report(
-        all_labels,
-        all_predictions,
-        target_names=[
-            "negative",
-            "neutral",
-            "positive",
-        ],
-        digits=4,
-        zero_division=0,
-    )
-
-    print(report)
-
-
-    # =====================================================
-    # Confusion Matrix
-    # =====================================================
-
-    cm = confusion_matrix(
-        all_labels,
-        all_predictions,
-    )
-
-    print(
-        "Confusion Matrix:"
-    )
-
-    print(
-        "Rows = Actual"
-    )
-
-    print(
-        "Columns = Predicted"
-    )
-
-    print(
-        "          neg  neu  pos"
-    )
-
-    print(
-        f"negative  "
-        f"{cm[0][0]:4d} "
-        f"{cm[0][1]:4d} "
-        f"{cm[0][2]:4d}"
-    )
-
-    print(
-        f"neutral   "
-        f"{cm[1][0]:4d} "
-        f"{cm[1][1]:4d} "
-        f"{cm[1][2]:4d}"
-    )
-
-    print(
-        f"positive  "
-        f"{cm[2][0]:4d} "
-        f"{cm[2][1]:4d} "
-        f"{cm[2][2]:4d}"
-    )
-
-
-    # =====================================================
-    # Build Error Analysis DataFrame
-    # =====================================================
-
-    analysis_df = dataset.df.copy()
-
-    analysis_df["true_label"] = [
-        ID_TO_LABEL[label]
-        for label in all_labels
-    ]
-
-    analysis_df["predicted_label"] = [
-        ID_TO_LABEL[pred]
-        for pred in all_predictions
-    ]
-
-    analysis_df["confidence"] = (
-        np.array(all_confidences)
-    )
-
-    analysis_df["correct"] = (
-        np.array(all_labels)
-        == np.array(all_predictions)
-    )
-
-
-    # =====================================================
-    # Error Type
-    # =====================================================
-
-    def get_error_type(row):
-
-        if row["correct"]:
-
-            return "correct"
-
-        return (
-            row["true_label"]
-            + " -> "
-            + row["predicted_label"]
+            images=images,
         )
 
-
-    analysis_df["error_type"] = (
-        analysis_df.apply(
-            get_error_type,
-            axis=1,
-        )
-    )
-
-
-    # =====================================================
-    # Error Summary
-    # =====================================================
-
-    errors = analysis_df[
-        ~analysis_df["correct"]
-    ]
-
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "Error Analysis Summary"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        f"Total validation samples: "
-        f"{len(analysis_df)}"
-    )
-
-    print(
-        f"Correct predictions: "
-        f"{analysis_df['correct'].sum()}"
-    )
-
-    print(
-        f"Incorrect predictions: "
-        f"{len(errors)}"
-    )
-
-
-    print(
-        "\nError Types:"
-    )
-
-    error_counts = (
-        errors["error_type"]
-        .value_counts()
-    )
-
-    for error_type, count in error_counts.items():
-
-        print(
-            f"{error_type:25s}: {count}"
+        probabilities = torch.softmax(
+            logits,
+            dim=1,
         )
 
-
-    # =====================================================
-    # Important Error Groups
-    # =====================================================
-
-    important_errors = [
-        "negative -> positive",
-        "negative -> neutral",
-        "neutral -> positive",
-        "neutral -> negative",
-        "positive -> neutral",
-        "positive -> negative",
-    ]
-
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "Important Error Groups"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    for error_type in important_errors:
-
-        subset = analysis_df[
-            analysis_df["error_type"]
-            == error_type
-        ]
-
-        print(
-            f"{error_type:25s}: "
-            f"{len(subset)}"
+        predictions = torch.argmax(
+            probabilities,
+            dim=1,
         )
 
-
-    # =====================================================
-    # Save Full Error Analysis
-    # =====================================================
-
-    os.makedirs(
-        "data",
-        exist_ok=True,
-    )
-
-    analysis_df.to_csv(
-        OUTPUT_PATH,
-        index=False,
-    )
-
-    print(
-        f"\nFull error analysis saved to:"
-    )
-
-    print(
-        OUTPUT_PATH
-    )
+        confidences = torch.max(
+            probabilities,
+            dim=1,
+        ).values
 
 
-    # =====================================================
-    # Print Examples
-    # =====================================================
+        # ----------------------------------------------------
+        # Save each sample
+        # ----------------------------------------------------
 
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "Representative Error Examples"
-    )
-
-    print(
-        "=" * 60
-    )
-
-
-    for error_type in important_errors:
-
-        subset = analysis_df[
-            analysis_df["error_type"]
-            == error_type
-        ].copy()
-
-        if len(subset) == 0:
-
-            continue
-
-        print(
-            "\n"
-            + "-" * 60
-        )
-
-        print(
-            f"{error_type}"
-        )
-
-        print(
-            "-" * 60
-        )
-
-        # Random sample, maximum 10
-        sample_size = min(
-            10,
-            len(subset),
-        )
-
-        examples = subset.sample(
-            n=sample_size,
-            random_state=SEED,
-        )
-
-        for i, (_, row) in enumerate(
-            examples.iterrows(),
-            start=1,
+        for i in range(
+            len(labels)
         ):
 
-            text = str(
-                row["text_corrected"]
+            true_label = (
+                labels[i]
+                .item()
             )
 
-            # Prevent enormous output
-            if len(text) > 300:
-
-                text = (
-                    text[:300]
-                    + "..."
-                )
-
-            print(
-                f"\nExample {i}"
+            pred_label = (
+                predictions[i]
+                .item()
             )
 
-            print(
-                f"Text: {text}"
+            confidence = (
+                confidences[i]
+                .item()
             )
 
-            print(
-                f"True: "
-                f"{row['true_label']}"
+            row = dataset.df.iloc[
+                sample_index
+            ]
+
+            image_name = row[
+                "image_name"
+            ]
+
+            text = texts[i]
+
+
+            all_true.append(
+                true_label
             )
 
-            print(
-                f"Predicted: "
-                f"{row['predicted_label']}"
-            )
-
-            print(
-                f"Confidence: "
-                f"{row['confidence']:.4f}"
+            all_pred.append(
+                pred_label
             )
 
 
-    # =====================================================
-    # High Confidence Wrong Predictions
-    # =====================================================
+            all_results.append(
+                {
+                    "index":
+                        sample_index,
+
+                    "image_name":
+                        image_name,
+
+                    "text":
+                        text,
+
+                    "true_label":
+                        LABEL_NAMES[
+                            true_label
+                        ],
+
+                    "predicted_label":
+                        LABEL_NAMES[
+                            pred_label
+                        ],
+
+                    "confidence":
+                        confidence,
+
+                    "correct":
+                        true_label
+                        == pred_label,
+                }
+            )
+
+
+            sample_index += 1
+
+
+# ============================================================
+# Classification Report
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 60
+)
+
+print(
+    "Classification Report"
+)
+
+print(
+    "=" * 60
+)
+
+
+print(
+    classification_report(
+        all_true,
+
+        all_pred,
+
+        labels=[
+            0,
+            1,
+            2,
+        ],
+
+        target_names=LABEL_NAMES,
+
+        zero_division=0,
+    )
+)
+
+
+# ============================================================
+# Confusion Matrix
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 60
+)
+
+print(
+    "Confusion Matrix"
+)
+
+print(
+    "=" * 60
+)
+
+
+cm = confusion_matrix(
+    all_true,
+
+    all_pred,
+
+    labels=[
+        0,
+        1,
+        2,
+    ],
+)
+
+
+cm_df = pd.DataFrame(
+    cm,
+
+    index=[
+        "true_negative",
+        "true_neutral",
+        "true_positive",
+    ],
+
+    columns=[
+        "pred_negative",
+        "pred_neutral",
+        "pred_positive",
+    ],
+)
+
+
+print(
+    cm_df
+)
+
+
+# ============================================================
+# Save CSV
+# ============================================================
+
+results_df = pd.DataFrame(
+    all_results
+)
+
+
+results_df.to_csv(
+    OUTPUT_PATH,
+
+    index=False,
+)
+
+
+print(
+    "\n✓ Error analysis saved:"
+)
+
+print(
+    OUTPUT_PATH
+)
+
+
+# ============================================================
+# Error groups
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 60
+)
+
+print(
+    "Most Important Error Groups"
+)
+
+print(
+    "=" * 60
+)
+
+
+# ============================================================
+# Negative → Positive
+# ============================================================
+
+group = results_df[
+    (
+        results_df["true_label"]
+        == "negative"
+    )
+    &
+    (
+        results_df["predicted_label"]
+        == "positive"
+    )
+].sort_values(
+    "confidence",
+    ascending=False,
+)
+
+
+print(
+    "\nNegative → Positive:"
+)
+
+
+if len(group) > 0:
 
     print(
-        "\n"
-        + "=" * 60
+        group[
+            [
+                "image_name",
+                "text",
+                "confidence",
+            ]
+        ]
+        .head(10)
+        .to_string(
+            index=False
+        )
     )
+
+else:
 
     print(
-        "High-Confidence Wrong Predictions"
+        "No samples."
     )
+
+
+# ============================================================
+# Negative → Neutral
+# ============================================================
+
+group = results_df[
+    (
+        results_df["true_label"]
+        == "negative"
+    )
+    &
+    (
+        results_df["predicted_label"]
+        == "neutral"
+    )
+].sort_values(
+    "confidence",
+    ascending=False,
+)
+
+
+print(
+    "\nNegative → Neutral:"
+)
+
+
+if len(group) > 0:
 
     print(
-        "=" * 60
+        group[
+            [
+                "image_name",
+                "text",
+                "confidence",
+            ]
+        ]
+        .head(10)
+        .to_string(
+            index=False
+        )
     )
 
-    high_conf_errors = (
-        errors
-        .sort_values(
+else:
+
+    print(
+        "No samples."
+    )
+
+
+# ============================================================
+# Neutral → Positive
+# ============================================================
+
+group = results_df[
+    (
+        results_df["true_label"]
+        == "neutral"
+    )
+    &
+    (
+        results_df["predicted_label"]
+        == "positive"
+    )
+].sort_values(
+    "confidence",
+    ascending=False,
+)
+
+
+print(
+    "\nNeutral → Positive:"
+)
+
+
+if len(group) > 0:
+
+    print(
+        group[
+            [
+                "image_name",
+                "text",
+                "confidence",
+            ]
+        ]
+        .head(10)
+        .to_string(
+            index=False
+        )
+    )
+
+else:
+
+    print(
+        "No samples."
+    )
+
+
+# ============================================================
+# Positive → Neutral
+# ============================================================
+
+group = results_df[
+    (
+        results_df["true_label"]
+        == "positive"
+    )
+    &
+    (
+        results_df["predicted_label"]
+        == "neutral"
+    )
+].sort_values(
+    "confidence",
+    ascending=False,
+)
+
+
+print(
+    "\nPositive → Neutral:"
+)
+
+
+if len(group) > 0:
+
+    print(
+        group[
+            [
+                "image_name",
+                "text",
+                "confidence",
+            ]
+        ]
+        .head(10)
+        .to_string(
+            index=False
+        )
+    )
+
+else:
+
+    print(
+        "No samples."
+    )
+
+
+# ============================================================
+# High confidence errors
+# ============================================================
+
+high_conf_errors = results_df[
+    results_df["correct"] == False
+].sort_values(
+    "confidence",
+    ascending=False,
+)
+
+
+print(
+    "\nHigh-confidence errors:"
+)
+
+
+print(
+    high_conf_errors[
+        [
+            "image_name",
+            "text",
+            "true_label",
+            "predicted_label",
             "confidence",
-            ascending=False,
-        )
-        .head(20)
+        ]
+    ]
+    .head(20)
+    .to_string(
+        index=False
     )
-
-    for i, (_, row) in enumerate(
-        high_conf_errors.iterrows(),
-        start=1,
-    ):
-
-        text = str(
-            row["text_corrected"]
-        )
-
-        if len(text) > 250:
-
-            text = (
-                text[:250]
-                + "..."
-            )
-
-        print(
-            f"\n{i}. "
-            f"{row['error_type']} "
-            f"(confidence="
-            f"{row['confidence']:.4f})"
-        )
-
-        print(
-            text
-        )
+)
 
 
-    # =====================================================
-    # Final
-    # =====================================================
-
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "Error analysis completed."
-    )
-
-    print(
-        "=" * 60
-    )
-
-
-# =========================================================
-# Run
-# =========================================================
-
-if __name__ == "__main__":
-
-    main()
+print(
+    "\n✓ Analysis complete."
+)
